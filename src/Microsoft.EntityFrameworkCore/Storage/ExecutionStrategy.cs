@@ -135,16 +135,37 @@ namespace Microsoft.EntityFrameworkCore.Storage
         /// <summary>
         ///     Executes the specified operation and returns the result.
         /// </summary>
-        /// <typeparam name="TResult">
-        ///     The return type of <paramref name="operation" />.
-        /// </typeparam>
         /// <param name="operation">
         ///     A delegate representing an executable operation that returns the result of type <typeparamref name="TResult" />.
         /// </param>
-        /// <param name="state">The state that will be passed to the operation.</param>
-        /// <typeparam name="TState">The type of the state.</typeparam>
-        /// <returns>The result from the operation.</returns>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The return type of <paramref name="operation" />. </typeparam>
+        /// <returns> The result from the operation. </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
         public virtual TResult Execute<TState, TResult>(Func<TState, TResult> operation, TState state)
+            => Execute(operation, null, state);
+
+        /// <summary>
+        ///     Executes the specified operation and returns the result.
+        /// </summary>
+        /// <param name="operation">
+        ///     A delegate representing an executable operation that returns the result of type <typeparamref name="TResult" />.
+        /// </param>
+        /// <param name="verifySucceeded"> A delegate that tests whether the operation succeeded even though an exception was thrown. </param>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The return type of <paramref name="operation" />. </typeparam>
+        /// <returns> The result from the operation. </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
+        public virtual TResult Execute<TState, TResult>(
+            [NotNull] Func<TState, TResult> operation,
+            [CanBeNull] Func<TState, ExecutionResult<TResult>> verifySucceeded,
+            [CanBeNull] TState state)
         {
             if (Suspended)
             {
@@ -153,16 +174,37 @@ namespace Microsoft.EntityFrameworkCore.Storage
 
             OnFirstExecution();
 
+            return ExecuteImplementation(operation, verifySucceeded, state);
+        }
+
+        private TResult ExecuteImplementation<TState, TResult>(
+            Func<TState, TResult> operation,
+            Func<TState, ExecutionResult<TResult>> verifySucceeded,
+            TState state)
+        {
             while (true)
             {
                 TimeSpan? delay;
                 try
                 {
                     Suspended = true;
-                    return operation(state);
+                    var result = operation(state);
+                    Suspended = false;
+                    return result;
                 }
                 catch (Exception ex)
                 {
+                    Suspended = false;
+                    if (verifySucceeded != null
+                        && UnwrapAndHandleException(ex, ShouldVerifySuccessOn))
+                    {
+                        var result = ExecuteImplementation(verifySucceeded, null, state);
+                        if (result.IsSuccessful)
+                        {
+                            return result.Result;
+                        }
+                    }
+
                     if (!UnwrapAndHandleException(ex, ShouldRetryOn))
                     {
                         throw;
@@ -177,10 +219,6 @@ namespace Microsoft.EntityFrameworkCore.Storage
                     }
 
                     OnRetry();
-                }
-                finally
-                {
-                    Suspended = false;
                 }
 
                 using (var waitEvent = new ManualResetEventSlim(false))
@@ -193,9 +231,6 @@ namespace Microsoft.EntityFrameworkCore.Storage
         /// <summary>
         ///     Executes the specified asynchronous operation and returns the result.
         /// </summary>
-        /// <typeparam name="TResult">
-        ///     The result type of the <see cref="Task{T}" /> returned by <paramref name="operation" />.
-        /// </typeparam>
         /// <param name="operation">
         ///     A function that returns a started task of type <typeparamref name="TResult" />.
         /// </param>
@@ -203,26 +238,66 @@ namespace Microsoft.EntityFrameworkCore.Storage
         ///     A cancellation token used to cancel the retry operation, but not operations that are already in flight
         ///     or that already completed successfully.
         /// </param>
-        /// <param name="state">The state that will be passed to the operation.</param>
-        /// <typeparam name="TState">The type of the state.</typeparam>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The result type of the <see cref="Task{T}" /> returned by <paramref name="operation" />. </typeparam>
         /// <returns>
         ///     A task that will run to completion if the original task completes successfully (either the
         ///     first time or after retrying transient failures). If the task fails with a non-transient error or
         ///     the retry limit is reached, the returned task will become faulted and the exception must be observed.
         /// </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
         public virtual Task<TResult> ExecuteAsync<TState, TResult>(
             Func<TState, CancellationToken, Task<TResult>> operation,
             TState state,
-            CancellationToken cancellationToken = default(CancellationToken)
-        ) => Suspended ? operation(state, cancellationToken) : ExecuteAsyncImplementation(operation, state, cancellationToken);
+            CancellationToken cancellationToken = default(CancellationToken))
+            => ExecuteAsync(operation, null, state, cancellationToken);
 
-        private async Task<TResult> ExecuteAsyncImplementation<TState, TResult>(
+        /// <summary>
+        ///     Executes the specified asynchronous operation and returns the result.
+        /// </summary>
+        /// <param name="operation">
+        ///     A function that returns a started task of type <typeparamref name="TResult" />.
+        /// </param>
+        /// <param name="verifySucceeded"> A delegate that tests whether the operation succeeded even though an exception was thrown. </param>
+        /// <param name="cancellationToken">
+        ///     A cancellation token used to cancel the retry operation, but not operations that are already in flight
+        ///     or that already completed successfully.
+        /// </param>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The result type of the <see cref="Task{T}" /> returned by <paramref name="operation" />. </typeparam>
+        /// <returns>
+        ///     A task that will run to completion if the original task completes successfully (either the
+        ///     first time or after retrying transient failures). If the task fails with a non-transient error or
+        ///     the retry limit is reached, the returned task will become faulted and the exception must be observed.
+        /// </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
+        public virtual Task<TResult> ExecuteAsync<TState, TResult>(
+            [NotNull] Func<TState, CancellationToken, Task<TResult>> operation,
+            [CanBeNull] Func<TState, CancellationToken, Task<ExecutionResult<TResult>>> verifySucceeded,
+            [CanBeNull] TState state,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            if (Suspended)
+            {
+                return operation(state, cancellationToken);
+            }
+
+            OnFirstExecution();
+            return ExecuteImplementationAsync(operation, verifySucceeded, state, cancellationToken);
+        }
+
+        private async Task<TResult> ExecuteImplementationAsync<TState, TResult>(
             Func<TState, CancellationToken, Task<TResult>> operation,
+            Func<TState, CancellationToken, Task<ExecutionResult<TResult>>> verifySucceeded,
             TState state,
             CancellationToken cancellationToken)
         {
-            OnFirstExecution();
-
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -231,10 +306,23 @@ namespace Microsoft.EntityFrameworkCore.Storage
                 try
                 {
                     Suspended = true;
-                    return await operation(state, cancellationToken);
+                    var result = await operation(state, cancellationToken);
+                    Suspended = false;
+                    return result;
                 }
                 catch (Exception ex)
                 {
+                    Suspended = false;
+                    if (verifySucceeded != null
+                        && UnwrapAndHandleException(ex, ShouldVerifySuccessOn))
+                    {
+                        var result = await ExecuteImplementationAsync(verifySucceeded, null, state, cancellationToken);
+                        if (result.IsSuccessful)
+                        {
+                            return result.Result;
+                        }
+                    }
+
                     if (!UnwrapAndHandleException(ex, ShouldRetryOn))
                     {
                         throw;
@@ -250,14 +338,89 @@ namespace Microsoft.EntityFrameworkCore.Storage
 
                     OnRetry();
                 }
-                finally
-                {
-                    Suspended = false;
-                }
 
                 await Task.Delay(delay.Value, cancellationToken);
             }
         }
+
+        /// <summary>
+        ///     Executes the specified operation in a transaction and returns the result after commiting it.
+        /// </summary>
+        /// <param name="operation">
+        ///     A delegate representing an executable operation that returns the result of type <typeparamref name="TResult" />.
+        /// </param>
+        /// <param name="verifySucceeded">
+        ///     A delegate that tests whether the operation succeeded even though an exception was thrown when the
+        ///     transaction was being committed.
+        /// </param>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The return type of <paramref name="operation" />. </typeparam>
+        /// <returns> The result from the operation. </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
+        public virtual TResult ExecuteInTransaction<TState, TResult>(
+            [NotNull] Func<TState, TResult> operation,
+            [NotNull] Func<TState, bool> verifySucceeded,
+            [CanBeNull] TState state)
+            => Execute(s =>
+                    {
+                        using (var transaction = Context.Database.BeginTransaction())
+                        {
+                            s.CommitFailed = false;
+                            s.Result = s.Operation(s.State);
+                            s.CommitFailed = true;
+                            transaction.Commit();
+                        }
+                        return s.Result;
+                    },
+                s => new ExecutionResult<TResult>(s.CommitFailed && s.VerifySucceeded(s.State), s.Result),
+                new ExecutionState<TState, TResult>(operation, verifySucceeded, state));
+
+        /// <summary>
+        ///     Executes the specified asynchronous operation and returns the result.
+        /// </summary>
+        /// <param name="operation">
+        ///     A function that returns a started task of type <typeparamref name="TResult" />.
+        /// </param>
+        /// <param name="verifySucceeded">
+        ///     A delegate that tests whether the operation succeeded even though an exception was thrown when the
+        ///     transaction was being committed.
+        /// </param>
+        /// <param name="cancellationToken">
+        ///     A cancellation token used to cancel the retry operation, but not operations that are already in flight
+        ///     or that already completed successfully.
+        /// </param>
+        /// <param name="state"> The state that will be passed to the operation. </param>
+        /// <typeparam name="TState"> The type of the state. </typeparam>
+        /// <typeparam name="TResult"> The result type of the <see cref="Task{T}" /> returned by <paramref name="operation" />. </typeparam>
+        /// <returns>
+        ///     A task that will run to completion if the original task completes successfully (either the
+        ///     first time or after retrying transient failures). If the task fails with a non-transient error or
+        ///     the retry limit is reached, the returned task will become faulted and the exception must be observed.
+        /// </returns>
+        /// <exception cref="RetryLimitExceededException">
+        ///     Thrown if the operation has not succeeded after the configured number of retries.
+        /// </exception>
+        public virtual Task<TResult> ExecuteInTransactionAsync<TState, TResult>(
+            [NotNull] Func<TState, CancellationToken, Task<TResult>> operation,
+            [NotNull] Func<TState, CancellationToken, Task<bool>> verifySucceeded,
+            [CanBeNull] TState state,
+            CancellationToken cancellationToken = default(CancellationToken))
+            => ExecuteAsync(async (s, c) =>
+                    {
+                        using (var transaction = await Context.Database.BeginTransactionAsync(c))
+                        {
+                            s.CommitFailed = false;
+                            s.Result = await s.Operation(s.State, c);
+                            s.CommitFailed = true;
+                            transaction.Commit();
+                        }
+                        return s.Result;
+                    },
+                async (s, c) => new ExecutionResult<TResult>(s.CommitFailed && await s.VerifySucceeded(s.State, c), s.Result),
+                new ExecutionStateAsync<TState, TResult>(operation, verifySucceeded, state));
 
         /// <summary>
         ///     Method called before the first operation execution
@@ -284,7 +447,7 @@ namespace Microsoft.EntityFrameworkCore.Storage
         /// <summary>
         ///     Determines whether the operation should be retried and the delay before the next attempt.
         /// </summary>
-        /// <param name="lastException">The exception thrown during the last execution attempt.</param>
+        /// <param name="lastException"> The exception thrown during the last execution attempt. </param>
         /// <returns>
         ///     Returns the delay indicating how long to wait for before the next execution attempt if the operation should be retried;
         ///     <c>null</c> otherwise
@@ -308,9 +471,19 @@ namespace Microsoft.EntityFrameworkCore.Storage
         }
 
         /// <summary>
+        ///     Determines whether the specified exception could be thrown after a successful execution.
+        /// </summary>
+        /// <param name="exception"> The exception object to be verified. </param>
+        /// <returns>
+        ///     <c>true</c> if the specified exception could be thrown after a successful execution, otherwise <c>false</c>.
+        /// </returns>
+        protected internal virtual bool ShouldVerifySuccessOn([NotNull] Exception exception)
+            => ShouldRetryOn(exception);
+
+        /// <summary>
         ///     Determines whether the specified exception represents a transient failure that can be compensated by a retry.
         /// </summary>
-        /// <param name="exception">The exception object to be verified.</param>
+        /// <param name="exception"> The exception object to be verified. </param>
         /// <returns>
         ///     <c>true</c> if the specified exception is considered as transient, otherwise <c>false</c>.
         /// </returns>
@@ -320,18 +493,55 @@ namespace Microsoft.EntityFrameworkCore.Storage
         ///     Recursively gets InnerException from <paramref name="exception" /> as long as it's an
         ///     exception created by Entity Framework and passes it to <paramref name="exceptionHandler" />
         /// </summary>
-        /// <typeparam name="T">The type of the unwrapped exception.</typeparam>
         /// <param name="exception"> The exception to be unwrapped. </param>
         /// <param name="exceptionHandler"> A delegate that will be called with the unwrapped exception. </param>
         /// <returns>
         ///     The result from <paramref name="exceptionHandler" />.
         /// </returns>
-        public static T UnwrapAndHandleException<T>([NotNull] Exception exception, [NotNull] Func<Exception, T> exceptionHandler)
+        public static bool UnwrapAndHandleException([NotNull] Exception exception, [NotNull] Func<Exception, bool> exceptionHandler)
         {
             var dbUpdateException = exception as DbUpdateException;
             return dbUpdateException != null
                 ? UnwrapAndHandleException(dbUpdateException.InnerException, exceptionHandler)
                 : exceptionHandler(exception);
+        }
+
+        private class ExecutionState<TState, TResult>
+        {
+            public ExecutionState(
+                Func<TState, TResult> operation,
+                Func<TState, bool> verifySucceeded,
+                TState state)
+            {
+                Operation = operation;
+                VerifySucceeded = verifySucceeded;
+                State = state;
+            }
+
+            public Func<TState, TResult> Operation { get; }
+            public Func<TState, bool> VerifySucceeded { get; }
+            public TState State { get; }
+            public TResult Result { get; set; }
+            public bool CommitFailed { get; set; }
+        }
+
+        private class ExecutionStateAsync<TState, TResult>
+        {
+            public ExecutionStateAsync(
+                Func<TState, CancellationToken, Task<TResult>> operation,
+                Func<TState, CancellationToken, Task<bool>> verifySucceeded,
+                TState state)
+            {
+                Operation = operation;
+                VerifySucceeded = verifySucceeded;
+                State = state;
+            }
+
+            public Func<TState, CancellationToken, Task<TResult>> Operation { get; }
+            public Func<TState, CancellationToken, Task<bool>> VerifySucceeded { get; }
+            public TState State { get; }
+            public TResult Result { get; set; }
+            public bool CommitFailed { get; set; }
         }
     }
 }

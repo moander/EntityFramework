@@ -26,7 +26,7 @@ namespace Microsoft.EntityFrameworkCore.Storage.Internal
             }
             catch (Exception ex)
             {
-                if (ExecutionStrategy.UnwrapAndHandleException(ex, SqlAzureRetriableExceptionDetector.ShouldRetryOn))
+                if (ExecutionStrategy.UnwrapAndHandleException(ex, TransientExceptionDetector.ShouldRetryOn))
                 {
                     throw new InvalidOperationException(SqlServerStrings.TransientExceptionDetected, ex);
                 }
@@ -46,7 +46,7 @@ namespace Microsoft.EntityFrameworkCore.Storage.Internal
             }
             catch (Exception ex)
             {
-                if (ExecutionStrategy.UnwrapAndHandleException(ex, SqlAzureRetriableExceptionDetector.ShouldRetryOn))
+                if (ExecutionStrategy.UnwrapAndHandleException(ex, TransientExceptionDetector.ShouldRetryOn))
                 {
                     throw new InvalidOperationException(SqlServerStrings.TransientExceptionDetected, ex);
                 }
